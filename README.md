@@ -65,8 +65,8 @@ This lets you inspect the source and build the binary on your own machine instea
 Credit where credit is due — none of this works without the people who built ps4debug/ps5debug in the first place:
 
 - **[jogolden](https://github.com/jogolden)** — original author of ps4debug
-- **[OpenSourcereR-dev](https://github.com/OpenSourcereR-dev)** — this tool uses [ps4debug-NG](https://github.com/OpenSourcereR-dev/ps4debug-NG) and [ps5debug-NG](https://github.com/OpenSourcereR-dev/ps5debug-NG)
 - **[Ctn123](https://github.com/ctn123)** and **[SiSTR0](https://github.com/SiSTR0)** — for their work on ps4debug/ps5debug
+- **[OpenSourcereR-dev](https://github.com/OpenSourcereR-dev)** — this tool uses [ps4debug-NG](https://github.com/OpenSourcereR-dev/ps4debug-NG) and [ps5debug-NG](https://github.com/OpenSourcereR-dev/ps5debug-NG)
 
 ---
 
