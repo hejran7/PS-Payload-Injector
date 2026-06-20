@@ -2,6 +2,10 @@
 
 A Simple Windows GUI tool for sending payloads to a PS4 or PS5 over the local network.
 
+<p align="center">
+  <img src="images/PS-Payload-Injector.png" width="600">
+</p>
+
 ---
 
 ## Features
