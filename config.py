@@ -22,8 +22,8 @@ GAME_DATA_DIR  = os.path.join(os.path.expanduser("~"), "Documents",
 CONFIG_FILE    = os.path.join(GAME_DATA_DIR, "settings.json")
 PAYLOADS_DIR   = os.path.join(GAME_DATA_DIR, "payloads")
 
-PAYLOAD_PS4_FILE = "ps4debug_v1_1_19.bin"
-PAYLOAD_PS5_FILE = "ps5debug_v1_0b5.elf"
+PAYLOAD_PS4_FILE = "ps4debug-NG_v1.2.2.bin"
+PAYLOAD_PS5_FILE = "ps5debug-NG_v1.2.7.elf"
 
 os.makedirs(GAME_DATA_DIR, exist_ok=True)
 

@@ -32,39 +32,58 @@ from injection import InjectionEngine, InjectionResult, InjectionStatus
 
 
 def _firewall_rule_ok(port: int) -> bool:
-    import subprocess, tempfile
-    ps1 = tempfile.NamedTemporaryFile(delete=False, suffix=".ps1",
-                                      mode="w", encoding="utf-8")
-    ps1.write(f"""
-$port = '{port}'
-$hasBlock = $false
-$hasAllow = $false
-Get-NetFirewallRule -Direction Inbound -Enabled True -ErrorAction SilentlyContinue | ForEach-Object {{
-    $pf = $_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
-    if ($pf -and ($pf.LocalPort -eq $port -or $pf.LocalPort -eq 'Any')) {{
-        if ($_.Action -eq 'Block') {{ $hasBlock = $true }}
-        if ($_.Action -eq 'Allow') {{ $hasAllow = $true }}
-    }}
-}}
-if ($hasBlock) {{ exit 1 }}
-if (-not $hasAllow) {{ exit 2 }}
-exit 0
-""")
-    ps1.close()
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1.name],
-            capture_output=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-    finally:
+    """Return True only if an inbound Allow rule exists for port and no Block rule overrides it."""
+    import subprocess
+
+    def _get_rules(name_filter):
         try:
-            os.unlink(ps1.name)
+            return subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule",
+                 f"name={name_filter}", "dir=in", "verbose"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            ).stdout
         except Exception:
-            pass
+            return ""
+
+    def _parse(out, target_port):
+        """Scan output for blocks containing target_port; return (has_allow, has_block)."""
+        has_allow = has_block = False
+        cur_port = cur_action = None
+        for line in out.splitlines():
+            line = line.strip()
+            low = line.lower()
+            if low.startswith("localport:"):
+                cur_port = line.split(":", 1)[1].strip()
+            elif low.startswith("action:"):
+                cur_action = line.split(":", 1)[1].strip().lower()
+            # New rule starts with "Rule Name:" — evaluate the previous block
+            elif low.startswith("rule name:") and cur_port is not None and cur_action is not None:
+                ports = [p.strip() for p in cur_port.split(",")]
+                if str(target_port) in ports:
+                    if cur_action == "allow":
+                        has_allow = True
+                    elif cur_action == "block":
+                        has_block = True
+                cur_port = cur_action = None
+        # Last block has no following "Rule Name:"
+        if cur_port is not None and cur_action is not None:
+            ports = [p.strip() for p in cur_port.split(",")]
+            if str(target_port) in ports:
+                if cur_action == "allow":
+                    has_allow = True
+                elif cur_action == "block":
+                    has_block = True
+        return has_allow, has_block
+
+    allow, block = _parse(_get_rules("Python PS4DBG"), port)
+    if block:
+        return False
+    if not allow:
+        return False
+    # Also check if any other rule blocks this port
+    _, any_block = _parse(_get_rules("all"), port)
+    return not any_block
 
 
 def _apply_firewall_rules_elevated() -> bool:
@@ -307,7 +326,7 @@ class PayloadInjectorWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PS Payload Injector v1.0 By hejran7")
+        self.setWindowTitle("PS Payload Injector v1.1 By hejran7")
         self.setStyleSheet(f"background-color: {BG_MAIN};")
         self.setMinimumSize(440, 320)
 
@@ -344,8 +363,9 @@ class PayloadInjectorWindow(QMainWindow):
                         pass
 
         QTimer.singleShot(0, self._apply_win32_frame)
-        QTimer.singleShot(300, self._check_firewall)
         QTimer.singleShot(100, self._probe_ps4debug)
+        QTimer.singleShot(2000, self._scan_lan)
+        self._check_firewall()
 
     def _apply_win32_frame(self):
         try:
@@ -503,16 +523,28 @@ class PayloadInjectorWindow(QMainWindow):
         gl.addWidget(mode_col, 1, 0, Qt.AlignTop)
 
         fw_wrap   = QWidget()
+        fw_wrap.setFixedWidth(90)
         fw_wrap_l = QVBoxLayout(fw_wrap)
         fw_wrap_l.setContentsMargins(0, 0, 0, 0)
         fw_wrap_l.setSpacing(2)
         fw_wrap_l.addWidget(_lbl(" "))
         self._fix_port_btn = _styled_btn(
-            "Fix Port 755 (Firewall)", "#1a3a5c", "white", "#1e4a7a", ROW_H, bold=False
+            "Fix Ports", "#1a3a5c", "white", "#1e4a7a", ROW_H, bold=False
         )
         self._fix_port_btn.clicked.connect(self._fix_port_755)
         fw_wrap_l.addWidget(self._fix_port_btn)
-        gl.addWidget(fw_wrap, 1, 1, 1, 2, Qt.AlignTop)
+        gl.addWidget(fw_wrap, 1, 1, Qt.AlignTop)
+
+        fw_empty_wrap = QWidget()
+        fw_empty_wrap.setFixedWidth(90)
+        fw_empty_l = QVBoxLayout(fw_empty_wrap)
+        fw_empty_l.setContentsMargins(0, 0, 0, 0)
+        fw_empty_l.setSpacing(2)
+        fw_empty_l.addWidget(_lbl(" "))
+        self._empty_btn = _styled_btn("Kill && Close", "#1a3a5c", "white", "#1e4a7a", ROW_H, bold=False)
+        self._empty_btn.clicked.connect(self._kill_port_744)
+        fw_empty_l.addWidget(self._empty_btn)
+        gl.addWidget(fw_empty_wrap, 1, 2, Qt.AlignTop)
 
         root.addWidget(grid)
 
@@ -741,7 +773,7 @@ class PayloadInjectorWindow(QMainWindow):
         from PySide6.QtCore import QUrl
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
-            if urls and urls[0].toLocalFile().lower().endswith((".bin", ".elf", ".payload")):
+            if urls and urls[0].toLocalFile().lower().endswith((".bin", ".elf", ".js", ".lua", ".jar")):
                 event.acceptProposedAction()
                 self._path_wrap.setStyleSheet(
                     "background-color: #0a1628; border: 1px solid #00aaff;"
@@ -758,7 +790,7 @@ class PayloadInjectorWindow(QMainWindow):
         if not urls:
             return
         fp = urls[0].toLocalFile()
-        if not fp.lower().endswith((".bin", ".elf", ".payload")):
+        if not fp.lower().endswith((".bin", ".elf", ".js", ".lua", ".jar")):
             return
         mode = self._mode_val
         self._use_builtin = False
@@ -789,7 +821,7 @@ class PayloadInjectorWindow(QMainWindow):
         )
         fp, _ = QFileDialog.getOpenFileName(
             self, "Select Payload", start_dir,
-            "Payload files (*.bin *.elf *.payload);;All files (*.*)",
+            "Payload files (*.bin *.elf *.js *.lua *.jar);;All files (*.*)",
         )
         if fp:
             self._path_edit.setText(self._norm(fp))
@@ -854,7 +886,12 @@ class PayloadInjectorWindow(QMainWindow):
 
     @Slot(str)
     def _append_log(self, msg: str):
-        self._log.append(msg)
+        if "BLOCKED" in msg and "fix required" in msg:
+            self._log.append(f'<span style="color:#ff4444;">{msg}</span>')
+        elif msg.startswith("[PROBE]"):
+            self._log.append(f'<span style="color:#4da6ff;">{msg}</span>')
+        else:
+            self._log.append(msg)
         sb = self._log.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -897,58 +934,54 @@ class PayloadInjectorWindow(QMainWindow):
             self.log(f"[PROBE] Port 744 not responding on {self._saved_ps_ip} - ready to inject.")
 
     def _check_firewall(self):
-        import platform
+        import platform, shutil
         if platform.system() != "Windows":
             return
-        appdata   = os.environ.get("APPDATA", os.path.dirname(os.path.abspath(__file__)))
-        fw_flag   = os.path.join(appdata, "PS_Payload_Injector", "firewall.json")
-        os.makedirs(os.path.dirname(fw_flag), exist_ok=True)
+        # Remove the flag file and folder entirely — no longer needed
         try:
-            if os.path.exists(fw_flag):
-                with open(fw_flag, "r", encoding="utf-8") as f:
-                    if json.load(f).get("firewall_fixed"):
-                        return
+            appdata = os.environ.get("APPDATA", "")
+            fw_dir  = os.path.join(appdata, "PS_Payload_Injector")
+            if os.path.isdir(fw_dir):
+                shutil.rmtree(fw_dir, ignore_errors=True)
         except Exception:
             pass
 
-        def _chk():
-            if _firewall_rule_ok(744) and _firewall_rule_ok(755):
-                try:
-                    with open(fw_flag, "w", encoding="utf-8") as f:
-                        json.dump({"firewall_fixed": True}, f)
-                except Exception:
-                    pass
-                return
-
-            self._firewall_prompt_signal.emit(fw_flag)
-
-        threading.Thread(target=_chk, daemon=True).start()
+        # Run synchronously so result appears at top of log before probe/scan messages
+        p744 = _firewall_rule_ok(744)
+        p755 = _firewall_rule_ok(755)
+        if p744 and p755:
+            self.log("[Firewall] Ports 744 and 755 are open.")
+        else:
+            self.log(
+                f"[Firewall] Port 744 {'open' if p744 else 'BLOCKED'} / "
+                f"Port 755 {'open' if p755 else 'BLOCKED'} — fix required."
+            )
+            QTimer.singleShot(0, lambda: self._firewall_prompt_signal.emit(""))
 
     @Slot(str)
-    def _on_firewall_prompt(self, fw_flag: str):
-        if _confirm_dialog(
-            self, "Firewall Setup",
-            "PS Payload Injector needs inbound TCP ports 744 and 755 open on all\n"
-            "network profiles to reach the PS4/PS5.\n\n"
-            "Apply firewall rules automatically?\n"
-            "(A UAC prompt will appear - click Yes to allow it.)",
+    def _on_firewall_prompt(self, _fw_flag: str):
+        if not _confirm_dialog(
+            self, "Firewall Setup Required",
+            "PS Payload Injector needs inbound TCP ports 744 and 755 allowed on ALL\n"
+            "network profiles (including Public) to work reliably on every boot.\n\n"
+            "Right now your firewall may block the connection to PS4/PS5.\n\n"
+            "Click Yes to fix this automatically (a UAC prompt will appear).\n"
+            "Click No to skip — you can fix it manually later.",
         ):
-            def _do():
-                ok = _apply_firewall_rules_elevated()
-                if ok:
-                    try:
-                        with open(fw_flag, "w", encoding="utf-8") as f2:
-                            json.dump({"firewall_fixed": True}, f2)
-                    except Exception:
-                        pass
-                    self.log_signal.emit(
-                        "[OK] Firewall rules applied - ports 744 and 755 are now open."
-                    )
-                else:
-                    self.log_signal.emit(
-                        "[FAIL] Firewall fix cancelled or failed (UAC denied)."
-                    )
-            threading.Thread(target=_do, daemon=True).start()
+            self.log("[Firewall] Skipped — fix ports manually if injection fails.")
+            return
+
+        def _do():
+            ok = _apply_firewall_rules_elevated()
+            if ok:
+                self.log_signal.emit(
+                    "[OK] Firewall rules applied — ports 744 and 755 are now open."
+                )
+            else:
+                self.log_signal.emit(
+                    "[FAIL] Firewall fix cancelled or failed (UAC denied)."
+                )
+        threading.Thread(target=_do, daemon=True).start()
 
     def _fix_port_755(self):
         import platform
@@ -972,6 +1005,254 @@ class PayloadInjectorWindow(QMainWindow):
             )
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _scan_lan(self):
+        def _run():
+            self.log_signal.emit("[SCAN] Please wait, scanning for PlayStation consoles ...")
+            import socket, ipaddress, subprocess, re, struct
+
+            found = {}
+            lock  = threading.Lock()
+
+            # ── Windows DNS cache (instant) ────────────────────────────────
+            try:
+                cache_out = subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-Command",
+                     "Get-DnsClientCache | Where-Object {$_.Entry -match '^PS[45]'}"
+                     " | Select-Object Entry,Data | Format-Table -HideTableHeaders"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                ).stdout
+                for line in cache_out.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        hostname = parts[0].upper().rstrip(".")
+                        ip_s     = parts[-1]
+                        if re.match(r"\d+\.\d+\.\d+\.\d+", ip_s) and \
+                                re.match(r"PS[45]", hostname):
+                            label = "PS4" if hostname.startswith("PS4") else "PS5"
+                            with lock:
+                                if ip_s not in found:
+                                    found[ip_s] = ("", f"{label} ({hostname})", "DNS Cache")
+            except Exception:
+                pass
+
+            # ── SSDP ───────────────────────────────────────────────────────
+            def _ssdp_scan():
+                SSDP_ADDR = "239.255.255.250"
+                SSDP_PORT = 1900
+                msg = (
+                    "M-SEARCH * HTTP/1.1\r\n"
+                    f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+                    'MAN: "ssdp:discover"\r\n'
+                    "MX: 3\r\n"
+                    "ST: urn:dial-multiscreen-org:service:dial:1\r\n"
+                    "\r\n"
+                ).encode()
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+                    sock.settimeout(4)
+                    sock.sendto(msg, (SSDP_ADDR, SSDP_PORT))
+                    deadline = time.time() + 4
+                    while time.time() < deadline:
+                        try:
+                            data, addr = sock.recvfrom(4096)
+                            src_ip = addr[0]
+                            text   = data.decode("latin-1", errors="replace")
+                            if re.search(r"PS[45]", text, re.IGNORECASE):
+                                name_m = re.search(r"friendlyName[>:\s]+([^\r\n<]+)", text, re.IGNORECASE)
+                                hostname = name_m.group(1).strip().upper() if name_m else ""
+                                label = "PS5" if "PS5" in (hostname + text).upper() else "PS4"
+                                display = f"{label} ({hostname})" if hostname else label
+                                with lock:
+                                    if src_ip not in found:
+                                        found[src_ip] = ("", display, "SSDP")
+                        except socket.timeout:
+                            break
+                        except Exception:
+                            pass
+                    sock.close()
+                except Exception:
+                    pass
+
+            # ── mDNS multicast ─────────────────────────────────────────────
+            def _mdns_scan():
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.settimeout(4)
+                    sock.bind(("", 5353))
+                    mreq = struct.pack("4sL", socket.inet_aton("224.0.0.251"), socket.INADDR_ANY)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    deadline = time.time() + 4
+                    while time.time() < deadline:
+                        try:
+                            data, addr = sock.recvfrom(4096)
+                            src_ip = addr[0]
+                            text   = data.decode("latin-1", errors="replace")
+                            m = re.search(r"(PS[45]-[A-Z0-9]+)", text, re.IGNORECASE)
+                            if m:
+                                hostname = m.group(1).upper()
+                                label = "PS4" if hostname.startswith("PS4") else "PS5"
+                                with lock:
+                                    if src_ip not in found:
+                                        found[src_ip] = ("", f"{label} ({hostname})", "mDNS")
+                        except socket.timeout:
+                            break
+                        except Exception:
+                            pass
+                    sock.close()
+                except Exception:
+                    pass
+
+            ssdp_thread = threading.Thread(target=_ssdp_scan, daemon=True)
+            mdns_thread = threading.Thread(target=_mdns_scan, daemon=True)
+            ssdp_thread.start()
+            mdns_thread.start()
+
+            # ── TCP probe → ARP → Unicast mDNS ────────────────────────────
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                local_ip = ""
+
+            if local_ip:
+                hosts = list(ipaddress.IPv4Network(f"{local_ip}/24", strict=False).hosts())
+
+                def _read_arp():
+                    result = {}
+                    try:
+                        out = subprocess.run(
+                            ["arp", "-a"], capture_output=True, text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                        ).stdout
+                    except Exception:
+                        return result
+                    for line in out.splitlines():
+                        m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([\da-fA-F-]{17})", line)
+                        if m:
+                            ip_s  = m.group(1)
+                            mac_s = re.sub(r"[^0-9A-Fa-f]", "", m.group(2)).upper()
+                            oui   = "-".join(mac_s[i:i+2] for i in range(0, 6, 2))
+                            if not ip_s.startswith(("224.", "239.", "255.")):
+                                result[ip_s] = oui
+                    return result
+
+                # Read ARP before probe to capture already-cached entries
+                live_ips = _read_arp()
+
+                def _probe(ip):
+                    ip_s = str(ip)
+                    for port in (80, 443, 9090, 9021, 744):
+                        try:
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.settimeout(0.15)
+                            s.connect_ex((ip_s, port))
+                            s.close()
+                        except Exception:
+                            pass
+
+                pt = [threading.Thread(target=_probe, args=(h,), daemon=True) for h in hosts]
+                for t in pt: t.start()
+                for t in pt: t.join()
+
+                # Merge with ARP after probe — picks up newly resolved entries
+                live_ips.update(_read_arp())
+
+                def _mdns_unicast(ip_s, oui):
+                    parts  = ip_s.split(".")
+                    ptr    = ".".join(reversed(parts)) + ".in-addr.arpa"
+                    qname  = b""
+                    for part in ptr.split("."):
+                        qname += bytes([len(part)]) + part.encode()
+                    qname += b"\x00"
+                    packet = (b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+                              + qname + b"\x00\x0c\x00\x01")
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.settimeout(0.8)
+                        s.sendto(packet, (ip_s, 5353))
+                        data, _ = s.recvfrom(4096)
+                        s.close()
+                        text = data.decode("latin-1", errors="replace")
+                        hm   = re.search(r"(PS[45]-[A-Z0-9]+)", text, re.IGNORECASE)
+                        if hm:
+                            hostname = hm.group(1).upper()
+                            label    = "PS4" if hostname.startswith("PS4") else "PS5"
+                            with lock:
+                                if ip_s not in found:
+                                    found[ip_s] = (oui, f"{label} ({hostname})", "Unicast mDNS")
+                    except Exception:
+                        pass
+
+                ut = [threading.Thread(target=_mdns_unicast, args=(ip, oui), daemon=True)
+                      for ip, oui in live_ips.items()]
+                for t in ut: t.start()
+                for t in ut: t.join(timeout=3)
+
+            ssdp_thread.join(timeout=5)
+            mdns_thread.join(timeout=5)
+
+            if found:
+                for ip_s, (oui, label, method) in found.items():
+                    mac_part = f"  {oui}" if oui else ""
+                    self.log_signal.emit(f"[SCAN] Found {label} at {ip_s}{mac_part}  [{method}]")
+            else:
+                self.log_signal.emit("[SCAN] No PS4/PS5 found on the network.")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _kill_port_744(self):
+        if not _confirm_dialog(
+            self, "Kill Port 744",
+            "This will force-kill any process holding a TCP connection on port 744.\n\n"
+            "Continue?",
+        ):
+            return
+        self.log("[KILL] Looking for processes on port 744 ...")
+
+        def _run():
+            import subprocess
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                        "Get-NetTCPConnection -ErrorAction SilentlyContinue"
+                        " | Where-Object { $_.RemotePort -eq 744 -or $_.LocalPort -eq 744 }"
+                        " | Select-Object -ExpandProperty OwningProcess"
+                        " | Sort-Object -Unique",
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                pids = [p.strip() for p in result.stdout.splitlines() if p.strip().isdigit()]
+                if not pids:
+                    self.log_signal.emit("[KILL] No process found holding port 744.")
+                    return
+                for pid in pids:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", pid],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    self.log_signal.emit(f"[KILL] Killed PID {pid} (port 744).")
+                self._payload_injected = False
+                self._inj_btn.setEnabled(True)
+                self._inj_btn.setText("Inject")
+                self._inj_btn.setStyleSheet(_bevel_qss(ACCENT_RED, "white", "bold 9pt", "#a01010"))
+                self._status_lbl.hide()
+            except Exception as e:
+                self.log_signal.emit(f"[KILL] Error: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _do_inject(self):
         ip       = self._ip_edit.text().strip()
